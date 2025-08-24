@@ -1,0 +1,308 @@
+#define BLYNK_TEMPLATE_ID "TMPL6usv2gknJ"
+#define BLYNK_TEMPLATE_NAME "NPK Monitor"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <HTTPClient.h>
+
+// Pin definitions
+#define DE 4
+#define RE 2
+#define RELAY_PIN 5       // Main pump relay
+#define N_VALVE_PIN 12    // Nitrogen valve relay
+#define P_VALVE_PIN 14    // Phosphorus valve relay
+#define K_VALVE_PIN 27    // Potassium valve relay
+
+// Inquiry frames
+const byte nitro_inquiry_frame[] = {0x01, 0x03, 0x00, 0x1e, 0x00, 0x01, 0xe4, 0x0c};
+const byte phos_inquiry_frame[] = {0x01, 0x03, 0x00, 0x1f, 0x00, 0x01, 0xb5, 0xcc};
+const byte pota_inquiry_frame[] = {0x01, 0x03, 0x00, 0x20, 0x00, 0x01, 0x85, 0xc0};
+
+// Calibration equations
+const float N_SLOPE = 1.0454;
+const float N_INTERCEPT = 107.3;
+const float P_SLOPE = 0.1805;
+const float P_INTERCEPT = 2.1736;
+const float K_SLOPE = 0.8986;
+const float K_INTERCEPT = 50.038;
+
+// Thresholds (mg/kg)
+const float N_THRESHOLD = 66.0;
+const float P_THRESHOLD = 26.0;
+const float K_THRESHOLD = 40.0;
+
+byte values[11];
+HardwareSerial modbus(1);
+
+char auth[] = "lnKsoQVZL7Eu-Xr4X7zqAikLw51ki0Aq";
+char ssid[] = "hi dustu";
+char pass[] = "11223344";
+
+const char* googleScriptUrl = "https://script.google.com/macros/s/AKfycbzv1inm9EtSrfKRppdDkHc8mRgJETtFQ20AhvqCEkY67VfFgIQ531a5AJ0YigqMpRx6/exec";
+
+void setup() {
+  Serial.begin(115200);
+  modbus.begin(4800, SERIAL_8N1, 16, 17);
+
+  // Initialize all control pins
+  pinMode(DE, OUTPUT);
+  pinMode(RE, OUTPUT);
+  digitalWrite(DE, LOW);
+  digitalWrite(RE, LOW);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(N_VALVE_PIN, OUTPUT);
+  pinMode(P_VALVE_PIN, OUTPUT);
+  pinMode(K_VALVE_PIN, OUTPUT);
+
+  // Start with all valves and pump off
+  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(N_VALVE_PIN, LOW);
+  digitalWrite(P_VALVE_PIN, LOW);
+  digitalWrite(K_VALVE_PIN, LOW);
+
+  Blynk.begin(auth, ssid, pass);
+  Serial.println("Connecting to Blynk...");
+  Serial.println("NPK Monitoring and Management System Initializing...");
+  delay(2000);
+}
+
+void loop() {
+  Blynk.run();
+
+  float nitrogen_val, phosphorus_val, potassium_val;
+  bool nValveActive = false;
+  bool pValveActive = false;
+  bool kValveActive = false;
+  bool pumpActive = false;
+
+  // Read raw sensor values
+  uint16_t raw_n = readSensor(nitro_inquiry_frame, sizeof(nitro_inquiry_frame));
+  delay(500);
+  uint16_t raw_p = readSensor(phos_inquiry_frame, sizeof(phos_inquiry_frame));
+  delay(500);
+  uint16_t raw_k = readSensor(pota_inquiry_frame, sizeof(pota_inquiry_frame));
+  delay(500);
+
+  // Print section header
+  Serial.println("\n=== Current Readings ===");
+
+  // Check if all readings are zero (special case)
+  if (raw_n == 0 && raw_p == 0 && raw_k == 0) {
+    nitrogen_val = 0;
+    phosphorus_val = 0;
+    potassium_val = 0;
+    
+    Serial.print("Nitrogen: ");
+    Serial.print(nitrogen_val);
+    Serial.println(" mg/kg");
+
+    Serial.print("Phosphorus: ");
+    Serial.print(phosphorus_val);
+    Serial.println(" mg/kg");
+
+    Serial.print("Potassium: ");
+    Serial.print(potassium_val);
+    Serial.println(" mg/kg");
+
+    activateAllValves();
+    activatePump();
+    nValveActive = true;
+    pValveActive = true;
+    kValveActive = true;
+    pumpActive = true;
+  } 
+  else {
+    // Apply calibration to normal readings
+    nitrogen_val = calibrateN(raw_n);
+    phosphorus_val = calibrateP(raw_p);
+    potassium_val = calibrateK(raw_k);
+    
+    // Print calibrated values
+    Serial.print("Nitrogen: ");
+    Serial.print(nitrogen_val);
+    Serial.println(" mg/kg");
+
+    Serial.print("Phosphorus: ");
+    Serial.print(phosphorus_val);
+    Serial.println(" mg/kg");
+
+    Serial.print("Potassium: ");
+    Serial.print(potassium_val);
+    Serial.println(" mg/kg");
+    
+    // Check thresholds and control valves
+    bool needPump = false;
+    
+    // Nitrogen control
+    if (nitrogen_val < N_THRESHOLD) {
+      digitalWrite(N_VALVE_PIN, HIGH);
+      nValveActive = true;
+      needPump = true;
+    } else {
+      digitalWrite(N_VALVE_PIN, LOW);
+      nValveActive = false;
+    }
+    
+    // Phosphorus control
+    if (phosphorus_val < P_THRESHOLD) {
+      digitalWrite(P_VALVE_PIN, HIGH);
+      pValveActive = true;
+      needPump = true;
+    } else {
+      digitalWrite(P_VALVE_PIN, LOW);
+      pValveActive = false;
+    }
+    
+    // Potassium control
+    if (potassium_val < K_THRESHOLD) {
+      digitalWrite(K_VALVE_PIN, HIGH);
+      kValveActive = true;
+      needPump = true;
+    } else {
+      digitalWrite(K_VALVE_PIN, LOW);
+      kValveActive = false;
+    }
+    
+    // Main pump control
+    if (needPump) {
+      activatePump();
+      pumpActive = true;
+    } else {
+      deactivatePump();
+      pumpActive = false;
+    }
+  }
+
+  // Print system status
+  Serial.println("\n=== System Status ===");
+  
+  // Nitrogen valve status
+  if (nValveActive) {
+    Serial.println("N Valve ACTIVATED - Nitrogen below threshold");
+  } else {
+    Serial.println("N Valve DEACTIVATED - Nitrogen sufficient");
+  }
+  
+  // Phosphorus valve status
+  if (pValveActive) {
+    Serial.println("P Valve ACTIVATED - Phosphorus below threshold");
+  } else {
+    Serial.println("P Valve DEACTIVATED - Phosphorus sufficient");
+  }
+  
+  // Potassium valve status
+  if (kValveActive) {
+    Serial.println("K Valve ACTIVATED - Potassium below threshold");
+  } else {
+    Serial.println("K Valve DEACTIVATED - Potassium sufficient");
+  }
+  
+  // Pump status
+  if (pumpActive) {
+    Serial.println("Pump ACTIVATED - One or more nutrients needed");
+  } else {
+    Serial.println("Pump DEACTIVATED - All nutrients sufficient");
+  }
+
+  // Send values to Blynk
+  Blynk.virtualWrite(V0, nitrogen_val);
+  Blynk.virtualWrite(V1, phosphorus_val);
+  Blynk.virtualWrite(V2, potassium_val);
+  Blynk.virtualWrite(V3, nValveActive ? "ON" : "OFF");
+  Blynk.virtualWrite(V4, pValveActive ? "ON" : "OFF");
+  Blynk.virtualWrite(V5, kValveActive ? "ON" : "OFF");
+  Blynk.virtualWrite(V6, pumpActive ? "ON" : "OFF");
+
+  // Send data to Google Sheets
+  sendToGoogleSheets(nitrogen_val, phosphorus_val, potassium_val, 
+                    nValveActive ? "ON" : "OFF", 
+                    pValveActive ? "ON" : "OFF", 
+                    kValveActive ? "ON" : "OFF", 
+                    pumpActive ? "ON" : "OFF");
+
+  delay(5000);
+}
+
+float calibrateN(uint16_t rawValue) {
+  return (N_SLOPE * rawValue) + N_INTERCEPT;
+}
+
+float calibrateP(uint16_t rawValue) {
+  return (P_SLOPE * rawValue) + P_INTERCEPT;
+}
+
+float calibrateK(uint16_t rawValue) {
+  return (K_SLOPE * rawValue) + K_INTERCEPT;
+}
+
+uint16_t readSensor(const byte* inquiry_frame, byte frame_size) {
+  digitalWrite(DE, HIGH);
+  digitalWrite(RE, HIGH);
+  delay(10);
+
+  while (modbus.available()) {
+    modbus.read();
+  }
+
+  if (modbus.write(inquiry_frame, frame_size) == frame_size) {
+    modbus.flush();
+    digitalWrite(DE, LOW);
+    digitalWrite(RE, LOW);
+    delay(100);
+
+    if (modbus.available() >= 7) {
+      for (byte i = 0; i < 7; i++) {
+        values[i] = modbus.read();
+      }
+      if (values[0] == 0x01 && values[1] == 0x03) {
+        return (values[3] << 8) | values[4];
+      }
+    }
+  }
+  return 0;
+}
+
+void sendToGoogleSheets(float nitrogen, float phosphorus, float potassium, 
+                       String nValveStatus, String pValveStatus, 
+                       String kValveStatus, String pumpStatus) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(googleScriptUrl);
+    http.addHeader("Content-Type", "application/json");
+
+    String payload = "{\"nitrogen\":" + String(nitrogen) + 
+                   ",\"phosphorus\":" + String(phosphorus) + 
+                   ",\"potassium\":" + String(potassium) + 
+                   ",\"nValveStatus\":\"" + nValveStatus + "\"" +
+                   ",\"pValveStatus\":\"" + pValveStatus + "\"" +
+                   ",\"kValveStatus\":\"" + kValveStatus + "\"" +
+                   ",\"pumpStatus\":\"" + pumpStatus + "\"}";
+
+    int httpResponseCode = http.POST(payload);
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      Serial.println("Data sent to Google Sheets successfully");
+    } else {
+      Serial.println("Error sending data to Google Sheets: " + String(httpResponseCode));
+    }
+    http.end();
+  } else {
+    Serial.println("WiFi not connected!");
+  }
+}
+
+void activatePump() {
+  digitalWrite(RELAY_PIN, HIGH);
+}
+
+void deactivatePump() {
+  digitalWrite(RELAY_PIN, LOW);
+}
+
+void activateAllValves() {
+  digitalWrite(N_VALVE_PIN, HIGH);
+  digitalWrite(P_VALVE_PIN, HIGH);
+  digitalWrite(K_VALVE_PIN, HIGH);
+  Serial.println("Emergency Mode: All sensors reading zero - Activating all Valves and Pump");
+}
